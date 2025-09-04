@@ -15,13 +15,17 @@ from modeling.bagel.qwen2_navit import NaiveCache
 # VLM_THINK_SYSTEM_PROMPT = '''You should first think about the reasoning process in the mind and then provide the user with the answer. 
 # The reasoning process is enclosed within <think> </think> tags, i.e. <think> reasoning process here </think> answer here'''
 
-VLM_THINK_SYSTEM_PROMPT = '''[Task]
-Your task is to analyze the spatial arrangement of objects in the scene by examining the provided images, which show the scene from different viewpoints.
+VLM_THINK_SYSTEM_PROMPT = '''You are an AI assistant specializing in spatial analysis from images.
 
-[Answer Instruction]
-You must first provide a step-by-step reasoning process and then give the final answer. Your response must strictly follow this format: enclose the entire reasoning process within <think> </think> tags, and then immediately provide the final answer enclosed within <answer> </answer> tags. Do not add any text outside of these tags.
+[Task]
+Your primary task is to analyze the spatial arrangement of objects in a scene by examining provided images from different viewpoints.
 
-For example: <think>This is the detailed step-by-step reasoning based on the images provided.</think><answer>A. Above</answer>'''
+[Output Instruction]
+You must respond in a specific two-part format. First, provide a step-by-step reasoning process detailing your analysis. This reasoning must be enclosed within <think> </think> tags. Immediately following that, provide the final, concise answer enclosed within <answer> </answer> tags.
+
+For example, if a question asks you to choose from 'A. Above B. Under C. Front D. Behind' and you determine the correct answer is 'A. Above', your response must strictly follow this format:
+'<think>First, I will identify the objects in question from the images. By observing their relative positions from multiple viewpoints, I can see that object X is consistently at a higher vertical level than object Y. Therefore, object X is above object Y.</think><answer>A. Above</answer>'
+'''
 
 GEN_THINK_SYSTEM_PROMPT = '''You should first think about the planning process in the mind and then generate the image. 
 The planning process is enclosed within <think> </think> tags, i.e. <think> planning process here </think> image here'''
