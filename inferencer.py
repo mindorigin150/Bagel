@@ -12,8 +12,16 @@ from modeling.bagel.qwen2_navit import NaiveCache
 
 
 
-VLM_THINK_SYSTEM_PROMPT = '''You should first think about the reasoning process in the mind and then provide the user with the answer. 
-The reasoning process is enclosed within <think> </think> tags, i.e. <think> reasoning process here </think> answer here'''
+# VLM_THINK_SYSTEM_PROMPT = '''You should first think about the reasoning process in the mind and then provide the user with the answer. 
+# The reasoning process is enclosed within <think> </think> tags, i.e. <think> reasoning process here </think> answer here'''
+
+VLM_THINK_SYSTEM_PROMPT = '''[Task]
+Your task is to analyze the spatial arrangement of objects in the scene by examining the provided images, which show the scene from different viewpoints.
+
+[Answer Instruction]
+You must first provide a step-by-step reasoning process and then give the final answer. Your response must strictly follow this format: enclose the entire reasoning process within <think> </think> tags, and then immediately provide the final answer enclosed within <answer> </answer> tags. Do not add any text outside of these tags.
+
+For example: <think>This is the detailed step-by-step reasoning based on the images provided.</think><answer>A. Above</answer>'''
 
 GEN_THINK_SYSTEM_PROMPT = '''You should first think about the planning process in the mind and then generate the image. 
 The planning process is enclosed within <think> </think> tags, i.e. <think> planning process here </think> image here'''
@@ -311,3 +319,85 @@ class InterleaveInferencer:
             elif isinstance(i, str):
                 output_dict['text'] = i
         return output_dict
+    
+    @torch.no_grad()
+    def batch_interleave_inference(
+        self,
+        batch_input_lists: List[List[Union[str, Image.Image]]], # 输入是批量的List[List]
+        think=False,
+        understanding_output=False,
+        max_think_token_n=2048,
+        do_sample=False,
+        text_temperature=0.3,
+    ) -> List[str]:     # 理解任务只返回文本列表
+        batch_size = len(batch_input_lists)
+        if batch_size == 0:
+            return []
+        
+        # 1. initialize context
+        kv_lens = [0] * batch_size
+        ropes = [0] * batch_size
+        past_key_values = NaiveCache(self.model.config.llm_config.num_hidden_layers)
+        
+        # Suppose that our input structures are the same
+        
+        with torch.autocast(device_type="cuda", enabled=True, dtype=torch.bfloat16):
+            # 2. deal with system prompt
+            if think:
+                system_prompt = VLM_THINK_SYSTEM_PROMPT if understanding_output else GEN_THINK_SYSTEM_PROMPT
+                prompts = [system_prompt] * batch_size
+                
+                generation_input, kv_lens, ropes = self.model.prepare_prompts(
+                    curr_kvlens=kv_lens, curr_rope=ropes, prompts=prompts, tokenizer=self.tokenizer, new_token_ids=self.new_token_ids
+                )
+                past_key_values = self.model.forward_cache_update_text(past_key_values, **generation_input)
+                
+            # 3. deal with interleaved images and texts
+            num_steps = len(batch_input_lists[0])
+            
+            for i in range(num_steps):
+                input_type_is_image = isinstance(batch_input_lists[0][i], Image.Image)
+                if input_type_is_image:
+                    # collect all images in this batch
+                    image_batch = [pil_img2rgb(item[i]) for item in batch_input_lists]
+                    
+                    # suppose understanding tasks, only use vit to update context
+                    generation_input, kv_lens, ropes = self.model.prepare_vit_images(
+                        curr_kvlens=kv_lens, curr_rope=ropes, images=image_batch, transforms=self.vit_transform, new_token_ids=self.new_token_ids,
+                    )
+                    past_key_values = self.model.forward_cache_update_vit(past_key_values, **generation_input)
+                else:       # for text
+                    # collect all texts
+                    text_batch = [item[i] for item in batch_input_lists]
+                    
+                    generation_input, kv_lens, ropes = self.model.prepare_prompts(
+                        curr_kvlens=kv_lens, curr_rope=ropes, prompts=text_batch, tokenizer=self.tokenizer, new_token_ids=self.new_token_ids
+                    )
+                    past_key_values = self.model.forward_cache_update_text(past_key_values, **generation_input)
+                    
+                # 4. generate text in batches
+                if understanding_output:
+                    generation_input = self.model.prepare_start_tokens(kv_lens, ropes, self.new_token_ids)
+                    unpacked_latent = self.model.generate_text(
+                        past_key_values=past_key_values,
+                        max_length=max_think_token_n,
+                        do_sample=do_sample,
+                        temperature=text_temperature,
+                        end_token_id=self.new_token_ids['eos_token_id'],
+                        **generation_input,
+                    )
+                    
+                    # use batch decode
+                    outputs = self.tokenizer.batch_decode(unpacked_latent.t())
+                    
+                    # clear every output
+                    cleaned_outputs = []
+                    for output in outputs:
+                        cleaned_output = output.split('<|im_end|>')[0].split('<|im_start|>')[1]
+                        cleaned_outputs.append(cleaned_output)
+                    
+                    return cleaned_outputs
+                else:
+                    # TODO: batch generate iamges logic
+                    raise NotImplementedError("Batch image generation is not implemented in this example.")
+            return []       # if not understanding_output, return empty list
