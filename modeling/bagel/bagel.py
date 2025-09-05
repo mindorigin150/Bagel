@@ -2,8 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+from enum import unique
 from typing import List, Tuple, Optional, Dict, Any
 
+from einops import pack
+from tomlkit import key, key_value
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -937,25 +940,52 @@ class Bagel(PreTrainedModel):
         max_length: int,
         do_sample: bool = False,
         temperature: float = 1.0,
+        repetition_penalty: float = 1.0,
         end_token_id: int = None,
     ):
+        """
+        past_key_values.seq_lens: 3214
+        packed_key_value_indexes.shape: (seq_lens, )
+        key_values_lens.shape: (batch_size, )
+        packed_start_tokens.shape: (batch_size, )
+        packed_query_position_ids.shape: (batch_size, )
+        """
+        # FIXME: tensors should be on the same device!!!
+        # Add for batch
+        batch_size = len(key_values_lens)
+        device = next(self.language_model.parameters()).device
+
+        # move all inputs to the same device
+        packed_key_value_indexes = packed_key_value_indexes.to(device, dtype=torch.long)
+        key_values_lens = key_values_lens.to(device, dtype=torch.long)
+        packed_start_tokens = packed_start_tokens.to(device, dtype=torch.long)
+        packed_query_position_ids = packed_query_position_ids.to(device, dtype=torch.long)
+        # track each sample and record if they're completed
+        is_done = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
         step = 0
-        generated_sequence = []
+        generated_tokens_list = []  # store token generated in each step
         curr_tokens = packed_start_tokens
+
         while step < max_length:
-            generated_sequence.append(curr_tokens)
+            generated_tokens_list.append(curr_tokens)
+
+            # prepare for model input
             packed_text_embedding = self.language_model.model.embed_tokens(curr_tokens)
             query_lens = torch.ones_like(curr_tokens)
+            
             packed_query_indexes = torch.cumsum(key_values_lens, dim=0) + torch.arange(
-                0, len(key_values_lens), 
-                device=key_values_lens.device, 
-                dtype=key_values_lens.dtype
+                0, batch_size,
+                device=device,
+                dtype=torch.long
             )
 
-            uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
-            for i in range(len(uppacked)):
-                uppacked[i] += i
-            packed_key_value_indexes = torch.cat(uppacked, dim=0)
+            kv_indices_list = []
+            for i in range(batch_size):
+                start = packed_query_indexes[i] - key_values_lens[i]
+                end = packed_query_indexes[i]
+                kv_indices_list.append(torch.arange(start, end, device=device, dtype=torch.long))
+            packed_key_value_indexes = torch.cat(kv_indices_list)
 
             extra_inputs = {}
             if self.use_moe:
@@ -977,27 +1007,54 @@ class Bagel(PreTrainedModel):
             packed_query_sequence = output.packed_query_sequence
             pred_logits = self.language_model.lm_head(packed_query_sequence)
 
+            key_values_lens = key_values_lens + 1
+            packed_query_position_ids = packed_query_position_ids + (~is_done).long()
+
+            # repetition penalty
+            if repetition_penalty != 1.0 and step > 0:
+                # convert generated list of tokens (list of tensor) into a tensor of (batch_size, seq_len)
+                prev_generated = torch.stack(generated_tokens_list, dim=1).to(pred_logits.device)
+                for i in range(batch_size):
+                    # only apply penalty for undone samples
+                    if not is_done[i]:
+                        unique_prev_tokens = prev_generated[i].unique()
+                        scores = pred_logits[i, unique_prev_tokens]
+                        scores = torch.where(scores > 0, scores / repetition_penalty, scores * repetition_penalty)
+                        pred_logits[i].scatter_(0, unique_prev_tokens, scores)
+
             if do_sample:
                 probs = nn.functional.softmax(pred_logits / temperature, dim=-1)
-                curr_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
             else:
-                curr_tokens = torch.argmax(pred_logits, dim=-1)
+                next_tokens = torch.argmax(pred_logits, dim=-1)
+            # if a sample has generated end_token, keep the same, else generate new token
+            # move next_tokens to be on the same device as curr_tokens
+            next_tokens = next_tokens.to(curr_tokens.device)
+            curr_tokens = torch.where(is_done, curr_tokens, next_tokens)
 
-            uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
-            for i in range(len(uppacked)):
-                uppacked[i] = torch.cat(
-                    [uppacked[i], torch.tensor([uppacked[i][-1] + 1], device=uppacked[i].device)], dim=0
-                )
-            packed_key_value_indexes = torch.cat(uppacked, dim=0)
-            key_values_lens = key_values_lens + 1
-            packed_query_position_ids = packed_query_position_ids + 1
+            # update state
+            if end_token_id is not None:
+                is_done.logical_or_(next_tokens == end_token_id)
+            
             step += 1
-
-            if end_token_id is not None and curr_tokens[0] == end_token_id: # only support batch=1
+            
+            # new stop condition
+            if is_done.all():
                 break
 
-        output_device = generated_sequence[0].device
-        return torch.stack([i.to(output_device) for i in generated_sequence], dim=0)
+        output_tokens_stacked = torch.stack(generated_tokens_list, dim=1)   # shape: (batch_size, seq_len)
+        final_outputs = []
+        for i in range(batch_size):
+            # find position of first eos token
+            eos_indices = (output_tokens_stacked[i] == end_token_id).nonzero(as_tuple=True)[0]
+            if len(eos_indices) > 0:
+                # truncated to eos token (not including eos)
+                final_outputs.append(output_tokens_stacked[i, :eos_indices[0]])
+            else:
+                # not generated eos token, return all
+                final_outputs.append(output_tokens_stacked[i])
+
+        return final_outputs
 
     # for evaluation
     @torch.no_grad()

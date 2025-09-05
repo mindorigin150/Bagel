@@ -212,7 +212,7 @@ class InterleaveInferencer:
             end_token_id=self.new_token_ids['eos_token_id'],
             **generation_input,
         )
-        output = self.tokenizer.decode(unpacked_latent[:,0])
+        output = self.tokenizer.decode(unpacked_latent[0])
         output = output.split('<|im_end|>')[0].split('<|im_start|>')[1]
         return output
         
@@ -379,29 +379,30 @@ class InterleaveInferencer:
                     )
                     past_key_values = self.model.forward_cache_update_text(past_key_values, **generation_input)
                     
-                # 4. generate text in batches
-                if understanding_output:
-                    generation_input = self.model.prepare_start_tokens(kv_lens, ropes, self.new_token_ids)
-                    unpacked_latent = self.model.generate_text(
-                        past_key_values=past_key_values,
-                        max_length=max_think_token_n,
-                        do_sample=do_sample,
-                        temperature=text_temperature,
-                        end_token_id=self.new_token_ids['eos_token_id'],
-                        **generation_input,
-                    )
-                    
-                    # use batch decode
-                    outputs = self.tokenizer.batch_decode(unpacked_latent.t())
-                    
-                    # clear every output
-                    cleaned_outputs = []
-                    for output in outputs:
-                        cleaned_output = output.split('<|im_end|>')[0].split('<|im_start|>')[1]
-                        cleaned_outputs.append(cleaned_output)
-                    
-                    return cleaned_outputs
-                else:
-                    # TODO: batch generate iamges logic
-                    raise NotImplementedError("Batch image generation is not implemented in this example.")
+            # 4. generate text in batches
+            if understanding_output:
+                generation_input = self.model.prepare_start_tokens(kv_lens, ropes, self.new_token_ids)
+                unpacked_latent = self.model.generate_text(
+                    past_key_values=past_key_values,
+                    max_length=max_think_token_n,
+                    do_sample=do_sample,
+                    temperature=text_temperature,
+                    end_token_id=self.new_token_ids['eos_token_id'],
+                    repetition_penalty=1.1,
+                    **generation_input,
+                )
+                
+                # use batch decode
+                outputs = self.tokenizer.batch_decode(unpacked_latent)
+                
+                # clear every output
+                cleaned_outputs = []
+                for output in outputs:
+                    cleaned_output = output.split('<|im_end|>')[0].split('<|im_start|>')[1]
+                    cleaned_outputs.append(cleaned_output)
+                
+                return cleaned_outputs
+            else:
+                # TODO: batch generate iamges logic
+                raise NotImplementedError("Batch image generation is not implemented in this example.")
             return []       # if not understanding_output, return empty list
