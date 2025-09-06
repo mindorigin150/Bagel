@@ -342,7 +342,7 @@ class PackedAttention(Qwen2Attention):
             past_key_states = past_key_values.key_cache[self.layer_idx]
             past_value_states = past_key_values.value_cache[self.layer_idx]
 
-            seqlens = sum(query_lens) + sum(key_values_lens)
+            seqlens = sum(query_lens) + sum(key_values_lens.long())
             merged_key_states = past_key_states.new_zeros((seqlens, self.num_key_value_heads, self.head_dim))
             merged_value_states = past_key_states.new_zeros((seqlens, self.num_key_value_heads, self.head_dim))
             merged_key_states[packed_query_indexes] = packed_key_states
@@ -560,7 +560,7 @@ class PackedAttentionMoT(Qwen2Attention):
             past_key_states = past_key_values.key_cache[self.layer_idx]
             past_value_states = past_key_values.value_cache[self.layer_idx]
 
-            seqlens = sum(query_lens) + sum(key_values_lens)
+            seqlens = sum(query_lens) + sum(key_values_lens.long())
             merged_key_states = past_key_states.new_zeros(size=[seqlens, self.num_key_value_heads, self.head_dim])
             merged_value_states = past_key_states.new_zeros(size=[seqlens, self.num_key_value_heads, self.head_dim])
             merged_key_states[packed_query_indexes] = packed_key_states
