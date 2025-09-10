@@ -310,6 +310,11 @@ def process_batch(question_file: str, output_dir: str, model_name: str, inferenc
                     
                     ans_file.flush() # 确保立即写入磁盘
                     progress_bar.update(len(batch_items))
+                    
+                    # ========== delete garbage of last batch ========
+                    del batch_outputs
+                    del batch_input_lists
+                    torch.cuda.empty_cache()
 
     # 结束后，缓冲区中不应再有任何内容
     if results_buffer:
