@@ -20,18 +20,31 @@ class BaseInferenceEngine(ABC):
         pass
 
 class VllmEngine(BaseInferenceEngine):
-    """Inference engine using vLLM for high-throughput generation."""
-    def __init__(self, model_path: str, tensor_parallel_size: int = 1):
+    """
+    Inference engine using vLLM for high-throughput generation.
+    
+    Args:
+        vllm_config: dict containing configs for vllm
+        {
+            "model_config": config for creating LLM
+            "sampling_config": config for SamplingParams
+        }
+    """
+    def __init__(self, vllm_config: dict):
+        model_config = vllm_config.get("model_config")
+        sampling_config = vllm_config.get("sampling_config")
         try:
             from vllm import LLM, SamplingParams
         except ImportError:
             raise ImportError("vLLM is not installed. Please install it with 'pip install vllm'.")
         
-        print(f"🚀 Initializing vLLM engine for model: {model_path}")
+        self.model = model_config.get("model")
+        print(f"🚀 Initializing vLLM engine for model: {self.model}")
         # trust_remote_code is often needed for new models
-        self.llm = LLM(model=model_path, trust_remote_code=True, tensor_parallel_size=tensor_parallel_size)
+        self.llm = LLM(**model_config)
         # You can customize sampling params here
-        self.sampling_params = SamplingParams(temperature=0.0, max_tokens=1024)
+        self.sampling_params = SamplingParams(**sampling_config)
+        self.model_path = model_config.get("model")
 
     def batch_generate(self, prompts: List[str]) -> List[str]:
         outputs = self.llm.generate(prompts, self.sampling_params)

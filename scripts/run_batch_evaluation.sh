@@ -21,7 +21,7 @@ echo "  Input Directory: ${INPUT_DIR}"
 echo "  Final Output Directory: ${FINAL_OUTPUT_DIR}"
 echo "  Judge Arguments: ${PYTHON_ARGS}"
 
-python -u scripts/run_evaluation.py \
+python -u -m ipdb -c continue scripts/run_evaluation.py \
     --batch_dir "${INPUT_DIR}" \
     --output_dir "${FINAL_OUTPUT_DIR}" \
     ${PYTHON_ARGS}

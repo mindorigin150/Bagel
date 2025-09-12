@@ -6,8 +6,9 @@ import json
 import concurrent.futures
 import time
 from tqdm import tqdm
-from typing import Dict, TypedDict, Any, List, Tuple
+from typing import Dict, TypedDict, Any, List, Tuple, Generator, final
 from .inference_engine import BaseInferenceEngine
+from transformers import AutoTokenizer
 
 # --- 1. Core Data Structures and Exceptions ---
 
@@ -22,35 +23,6 @@ class JudgementError(Exception):
 
 # --- 2. Shared Prompt Template ---
 
-# Centralized prompt template to ensure consistency across all judges.
-# Using .format() with named placeholders {gt_answer} and {model_answer}.
-"""This prompt is still not enough"""
-# JUDGE_PROMPT_TEMPLATE = """Please act as an impartial and intelligent judge. Your task is to evaluate the quality of an AI assistant's response based on a provided reference answer.
-# Your evaluation must follow these crucial rules:
-# 1.  **Focus on Semantic Correctness, Not Literal Matching**: Your primary goal is to determine if the assistant's answer correctly identifies the core information from the reference answer. Do not penalize for minor formatting differences, verbosity, or extra explanations, as long as the core answer is correct.
-#     *   **Example**: If the reference answer is "A", the following assistant answers are all considered **CORRECT**:
-#         *   "A. Yes"
-#         *   "A"
-#         *   "The correct answer is A."
-#         *   "<think>...</think><answer>A</answer>"
-#         *   "Based on my analysis, the answer is A. Yes."
-# 2.  **Evaluate the Reasoning Process**: If the final answer part is missing, incorrect, or ambiguous, you MUST inspect the assistant's entire response (including any text within `<think>` tags or similar). If the reasoning process clearly and correctly identifies the right answer before the final output, it should be considered **CORRECT**.
-#     *   **Example**: The reference answer is "A". The assistant says: "<think>After analyzing the images, it's clear option A is the correct one. But let me double-check the details of image 2 one more time...</think>" (output truncated here). This should be judged as **CORRECT** because the reasoning identified the right answer.
-# 3.  **Strict Output Format**: You must return your verdict as a single JSON object. The JSON object should have two keys:
-#     *   `"is_correct"`: A boolean value (`true` or `false`).
-#     *   `"reason"`: A brief, clear justification for your verdict, especially if you had to rely on Rule #2.
-# [BEGIN DATA]
-# ***
-# [Reference Answer]:
-# {gt_answer}
-# ***
-# [Assistant's Answer]:
-# {model_answer}
-# ***
-# [END DATA]
-# Your verdict:
-# """
-"""An enhanced version"""
 JUDGE_PROMPT_TEMPLATE = """Please act as an impartial and intelligent judge. Your task is to evaluate the quality of an AI assistant's response based on a provided reference answer.
 
 Your evaluation must follow these crucial rules:
@@ -79,6 +51,9 @@ Your evaluation must follow these crucial rules:
 
 [BEGIN DATA]
 ***
+[Question]:
+{question}
+***
 [Reference Answer]:
 {gt_answer}
 ***
@@ -98,19 +73,19 @@ class BaseJudge(abc.ABC):
     Abstract interface defining the contract for all judge implementations.
     """
     @abc.abstractmethod
-    def judge(self, model_answer: str, ground_truth_answer: str) -> JudgementResult:
+    def judge(self, question: str, model_answer: str, ground_truth_answer: str) -> JudgementResult:
         """
         Compares a model's answer to the ground truth and returns a structured judgment.
         """
         raise NotImplementedError
 
-    def batch_judge(self, items: List[Tuple[str, str]]) -> List[JudgementResult]:
+    def batch_judge(self, items: List[Tuple[str, str]]) -> Generator[Tuple[int, JudgementResult], Any, None]:
         """
-        Evaluates a batch of items. Default implementation calls judge() in a loop.
-        Subclasses can override this for more efficient batching.
+        Default generator implementation. Evaluates items one by one and yields results.
+        This is correct, but inefficient. Subclasses SHOULD override this.
         """
-        # A simple, default implementation. It works, but it's not efficient.
-        return [self.judge(model_answer, gt_answer) for model_answer, gt_answer in items]
+        for i, (question, model_answer, gt_answer) in enumerate(items):
+            yield i, self.judge(question, model_answer, gt_answer)
 
 
 def _parse_llm_json_output(model_output: str) -> JudgementResult:
@@ -149,8 +124,20 @@ def _parse_llm_json_output(model_output: str) -> JudgementResult:
 
 # --- 4. Concrete Judge Implementations ---
 class APIModelJudge(BaseJudge):
-    """Judges correctness by calling an external API (e.g., OpenAI, Anthropic)."""
-    def __init__(self, endpoint: str, api_key: str = None, timeout: int = 30, model: str = "gpt-4o", max_workers: int = 4, requests_per_minute: int = 29):
+    """
+    Judges correctness by calling an external API (e.g., OpenAI, Anthropic).
+    This version operates sequentially with rate limiting and retry logic.
+    """
+    def __init__(self, endpoint: str, api_key: str = None, timeout: int = 120, model: str = "gpt-4o", max_retries: int = 10, requests_per_minute: int = 60):
+        """
+        Args:
+            endpoint: The API endpoint URL.
+            api_key: The API key for authentication.
+            timeout: Request timeout in seconds.
+            model: The model name to use.
+            max_retries: The maximum number of times to retry a failed API request.
+            requests_per_minute: The number of requests to allow per minute for rate limiting.
+        """
         if not endpoint:
             raise ValueError("API endpoint cannot be empty.")
         self.endpoint = endpoint
@@ -159,122 +146,166 @@ class APIModelJudge(BaseJudge):
             self.headers["Authorization"] = f"Bearer {api_key}"
         self.timeout = timeout
         self.model = model
-        self.max_workers = max_workers
-
+        self.max_retries = max_retries
         if requests_per_minute <= 0:
             raise ValueError("requests_per_minute must be positive.")
+        # calculate interval for each request
         self.request_interval = 60.0 / requests_per_minute
 
-    def judge(self, model_answer: str, ground_truth_answer: str) -> JudgementResult:
-        prompt = JUDGE_PROMPT_TEMPLATE.format(gt_answer=ground_truth_answer, model_answer=model_answer)
-        
+    def judge(self, question: str, model_answer: str, ground_truth_answer: str) -> JudgementResult:
+        """
+        Sends a single, robust request to the API, with built-in retries for network errors.
+        """
+        prompt = JUDGE_PROMPT_TEMPLATE.format(
+            question=question,
+            gt_answer=ground_truth_answer,
+            model_answer=model_answer
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
         }
         
-        try:
-            response = requests.post(self.endpoint, headers=self.headers, json=payload, timeout=self.timeout)
-            response.raise_for_status()
-            content = response.json()['choices'][0]['message']['content']
-            return _parse_llm_json_output(content)
+        last_exception = None
+        
+        # Retry logic for each request
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = requests.post(self.endpoint, headers=self.headers, json=payload, timeout=self.timeout)
+                response.raise_for_status()  # 如果状态码是 4xx 或 5xx，则抛出异常
+                content = response.json()['choices'][0]['message']['content']
+                return _parse_llm_json_output(content)
             
-        except requests.exceptions.RequestException as e:
-            return {"is_correct": False, "reason": f"API request failed: {e}"}
-        except (KeyError, IndexError) as e:
-            return {"is_correct": False, "reason": f"Invalid API response format: {e}"}
+            except requests.exceptions.RequestException as e:
+                # 捕获网络层面的错误 (e.g., timeout, connection error)
+                last_exception = e
+                print(f"⚠️ API request failed (attempt {attempt + 1}/{self.max_retries + 1}). Error: {e}")
+                if attempt < self.max_retries:
+                    time.sleep(1)  # a short break before retrying
+                continue
+            
+            except (KeyError, IndexError) as e:
+                # catch invalid API response format, which is normally permanent and no need to retry
+                return {"is_correct": False, "reason": f"Invalid API response format: {e}"}
+        
+        # If all attempts failed
+        return {"is_correct": False, "reason": f"API request failed after {self.max_retries + 1} attempts. Last error: {last_exception}"}
 
-    def batch_judge(self, items: List[Tuple[str, str]]) -> List[JudgementResult]:
+    def batch_judge(self, items: List[Tuple[str, str, str]]) -> Generator[Tuple[int, JudgementResult], Any, None]:
         """
-        Efficiently judges a batch of items with rate limiting and progress feedback.
-        It has two progress bars: one for submitting tasks, one for collecting results.
+        Judges a batch of items sequentially with rate limiting.
+        This implementation uses a simple for loop, without concurrency.
         """
         if not items:
-            return []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # --- 阶段 1: 提交任务，带进度条 ---
-            futures = []
-            # 用 tqdm 包装 'items' 迭代器
-            for model_answer, gt_answer in tqdm(items, desc="Submitting API tasks", unit="task"):
-                future = executor.submit(self.judge, model_answer, gt_answer)
-                futures.append(future)
+            return
+
+        for i, (question, model_answer, gt_answer) in enumerate(tqdm(items, desc="Judging items sequentially", unit="item")):
+            result = self.judge(question, model_answer, gt_answer)
+            yield i, result
+
+            if i < len(items) - 1:
                 time.sleep(self.request_interval)
-            # --- 阶段 2: 收集结果，也带进度条 ---
-            results = []
-            # 用 tqdm 包装 'futures' 迭代器
-            for future in tqdm(concurrent.futures.as_completed(futures), desc="Collecting API results", total=len(futures), unit="result"):
-                try:
-                    results.append(future.result())
-                except Exception as exc:
-                    error_result = {
-                        "is_correct": False,
-                        "reason": f"An unexpected error occurred during future execution: {exc}"
-                    }
-                    results.append(error_result)
-        
-        # as_completed's results are not ordered, so we need to reorder them
-        # Let's fix this mess from the previous version. The order of items must be preserved.
-        # The code above using as_completed is WRONG because it breaks the order.
-        # This is the correct way, which I provided before. Let's stick to it.
-        # My apologies, as_completed is a distraction here. Let's get back to the simple, correct code.
-        # === CORRECTED AND FINAL IMPLEMENTATION ===
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # Stage 1: Submission with progress
-            futures = []
-            for model_answer, gt_answer in tqdm(items, desc="Submitting API tasks", unit="task"):
-                future = executor.submit(self.judge, model_answer, gt_answer)
-                futures.append(future)
-                time.sleep(self.request_interval)
-            
-            # Stage 2: Collection with progress. Iterating the futures list directly PRESERVES ORDER.
-            results = []
-            for future in tqdm(futures, desc="Collecting API results", unit="result"):
-                try:
-                    results.append(future.result())
-                except Exception as exc:
-                    error_result = {
-                        "is_correct": False,
-                        "reason": f"An unexpected error occurred during future execution: {exc}"
-                    }
-                    results.append(error_result)
-        
-        return results
 
 
 class LocalJudge(BaseJudge):
     """Judges correctness using a local model via a unified inference engine."""
-    
-    _template = "[INST] {system_prompt}\n{prompt} [/INST]"
-    _system_prompt = "You are a helpful and precise assistant for checking the quality of AI responses."
-
-    def __init__(self, engine: BaseInferenceEngine):
+    def __init__(self, engine: BaseInferenceEngine, max_retries: int = 10):
         """
         Args:
             engine: An initialized instance of a class derived from BaseInferenceEngine.
+            max_retries: When output of model cannot be parsed, the max retry times.
         """
         self.engine = engine
+        self.model = engine.model
+        self.tokenizer = AutoTokenizer.from_pretrained(engine.model_path, trust_remote_code=True)
+        self.max_retries = max_retries
 
-    def _format_prompt(self, model_answer: str, ground_truth_answer: str) -> str:
+    def _format_prompt(self, question: str, model_answer: str, ground_truth_answer: str) -> str:
         """Formats the final prompt including the system message and instruction wrapper."""
-        judge_prompt = JUDGE_PROMPT_TEMPLATE.format(
+        prompt = JUDGE_PROMPT_TEMPLATE.format(
+            question=question,
             gt_answer=ground_truth_answer,
             model_answer=model_answer
         )
-        return self._template.format(system_prompt=self._system_prompt, prompt=judge_prompt)
+        messages = [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+        formatted_prompt_string = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=True,
+        )
+        return formatted_prompt_string
 
-    def judge(self, model_answer: str, ground_truth_answer: str) -> JudgementResult:
+    def judge(self, question: str, model_answer: str, ground_truth_answer: str) -> JudgementResult:
         """Generates a single judgement using the local inference engine."""
-        prompt = self._format_prompt(model_answer, ground_truth_answer)
-        responses = self.engine.batch_generate([prompt])
-        return _parse_llm_json_output(responses[0])
+        prompt = self._format_prompt(question, model_answer, ground_truth_answer)
+        last_result = None
+        for attempt in range(self.max_retries + 1):
+            responses = self.engine.batch_generate([prompt])
+            result = _parse_llm_json_output(responses[0])
+            
+            if "Failed to parse" not in result["reason"]:
+                return result
+            
+            last_result = result
+            if attempt < self.max_retries:
+                print(f"⚠️ Retrying judgement due to parsing failure (attempt {attempt + 1}/{self.max_retries})...")
+                
+        # return the last result if all attempts failed
+        print(f"❌ Judgement failed after {self.max_retries} retries.")
+        return last_result
 
-    def batch_judge(self, items: List[Tuple[str, str]]) -> List[JudgementResult]:
+    def batch_judge(self, items: List[Tuple[str, str]]) -> Generator[Tuple[int, JudgementResult], Any, None]:
         """
-        Efficiently judges a batch of items by sending them all to the engine at once.
-        This overrides the inefficient default implementation in BaseJudge.
+        Efficiently judges a batch of items by sending them all to the engine at once,
+        then yields the results to maintain a consistent generator interface.
         """
-        # This is the real advantage of this class.
-        prompts = [self._format_prompt(ans, gt) for ans, gt in items]
-        responses = self.engine.batch_generate(prompts)
-        return [_parse_llm_json_output(resp) for resp in responses]
-
+        if not items:
+            return
+        
+        # 1. put all original items and their indexes into todo list
+        items_to_judge = [(i, question, ans, gt) for i, (question, ans, gt) in enumerate(items)]
+        
+        for attempt in range(self.max_retries + 1):
+            if not items_to_judge:
+                break
+            print(f"🚀 Starting judgement batch... Attempt {attempt + 1}, items remaining: {len(items_to_judge)}")
+            
+            # prepare prompts for current batch
+            prompts = [self._format_prompt(question, ans, gt) for _, question, ans, gt in items_to_judge]
+            responses = self.engine.batch_generate(prompts)
+            
+            # prepare an empty list for next retry
+            failed_items_for_next_round = []
+            # process results for current batch
+            for i, response in enumerate(responses):
+                original_index, model_answer, gt_answer = items_to_judge[i]
+                # parse output
+                result = _parse_llm_json_output(response)
+                # determine if success or not
+                if "Failed to parse" not in result["reason"]:
+                    yield original_index, result
+                else:
+                    failed_items_for_next_round.append(items_to_judge[i])
+            
+            items_to_judge = failed_items_for_next_round
+            if items_to_judge:
+                print(f"⚠️ {len(items_to_judge)} items failed parsing. Preparing for retry {attempt + 1}/{self.max_retries}...")
+        
+        for original_index, _, _ in items_to_judge:
+            final_error_result = {
+                "is_correct": False,
+                "reason": f"Failed to parse model judgement after {self.max_retries} retries."
+            }
+            yield original_index, final_error_result

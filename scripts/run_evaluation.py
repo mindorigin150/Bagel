@@ -37,35 +37,88 @@ Examples:
     # --- Simplified Options ---
     parser.add_argument('--quiet', '-q', action='store_true', help='Quiet mode')
 
+    parser.add_argument('--judge-type', type=str, choices=['api', 'local'],
+                             help='Type of judge model.')
     # --- Judgement Options ---
-    judge_group = parser.add_argument_group('Judgement Options', 'Configure a model-based judge.')
-    judge_group.add_argument('--judge-type', type=str, choices=['api', 'local'],
-                             help='Type of judge model. If not set, uses rule-based matching.')
-    judge_group.add_argument('--judge-model-path', type=str,
+    local_group = parser.add_argument_group('Local Judgement Options', 'Configure a local judge.')
+
+    # select local judge inference engine
+    local_group.add_argument('--engine', type=str, choices=['vllm', 'hf'], default='vllm', help='Inference engine for local judge (default: vllm).')
+
+    # --- configuration for vllm ---
+    local_group.add_argument('--model-path', type=str,
                              help='Path to local judge model (for --judge-type local).')
-    judge_group.add_argument('--tensor-parallel-size', type=int, help='Tensor parallel size for vllm.')
-    judge_group.add_argument('--judge-api-endpoint', type=str,
+    local_group.add_argument('--tensor-parallel-size', type=int, help='Tensor parallel size for vllm.')
+    local_group.add_argument('--max-model-len', type=int, help='Max model length')
+
+    local_group.add_argument('--temperature', type=float, help='Temperature parameter for vllm sampling')
+    local_group.add_argument('--max-tokens', type=int, help='Max tokens parameter for vllm sampling')
+    local_group.add_argument('--top-k', type=int, help='Top-k parameter for vllm sampling')
+    local_group.add_argument('--top-p', type=float, help='Top-p parameter for vllm sampling')
+    local_group.add_argument('--repetition-penalty', type=float, help='Repetition penalty')
+    
+    
+    # --- configuration for api ---
+    api_group = parser.add_argument_group('API Judgement Options', 'Configure a api judge')
+    api_group.add_argument('--endpoint', type=str,
                              help='API endpoint for judge model (for --judge-type api).')
-    judge_group.add_argument('--judge-api-key', type=str, help='API key (optional).')
-    judge_group.add_argument('--engine', type=str, choices=['vllm', 'hf'], default='vllm',
-                             help='Inference engine for local judge (default: vllm).')
-    judge_group.add_argument('--judge-model-name', type=str, help='Model name for API judge')
+    api_group.add_argument('--api-key', type=str, help='API key.')
+    api_group.add_argument('--timeout', type=int, default=120, help='Timeout for API request')
+    api_group.add_argument('--model-name', type=str, help='Model for API request')
+    api_group.add_argument('--max-retries', type=int, default=10, help='Max retry time for model, if the json result can\'t be parsed.')
+    api_group.add_argument('--requests-per-minute', type=int, default=60, help='Requests sent per minute')
     
     args = parser.parse_args()
 
     judge_config: Optional[Dict[str, Any]] = None
-    if args.judge_type:
-        if args.judge_type == 'local' and not args.judge_model_path:
-            parser.error("--judge-model-path is required for --judge-type local")
-        
-        judge_config = {
-            "judge_type": args.judge_type, "model_path": args.judge_model_path, 'tensor_parallel_size': args.tensor_parallel_size,
-            "api_endpoint": args.judge_api_endpoint, "api_key": args.judge_api_key,
-            "engine": args.engine, "model_name": args.judge_model_name
+
+    if args.judge_type == 'local':
+        if not args.model_path:
+            parser.error("--model-path is required for local model as judge. (For local model as judge, this should be the path to the model you use)")
+
+        if args.engine == "vllm":
+            model_config = {
+                "model": args.model_path,
+                "tensor_parallel_size": args.tensor_parallel_size,
+                "max_model_len": args.max_model_len,
+                "trust_remote_code": True
+            }
+
+            sampling_config = {
+                "temperature": args.temperature,
+                "max_tokens": args.max_tokens,
+                "top_p": args.top_p,
+                "top_k": args.top_k,
+            }
+            vllm_config = {
+                "model_config": model_config,
+                "sampling_config": sampling_config,
+            }
+            judge_config = {
+                "judge_type": args.judge_type, "vllm_config": vllm_config,
+                "engine": args.engine
+            }
+        else:
+            raise NotImplementedError("Not support other engines now")
+
+    elif args.judge_type == 'api':
+        api_config = {
+            "endpoint": args.endpoint,
+            "api_key": args.api_key,
+            "timeout": args.timeout,
+            "model": args.model_name,
+            "max_retries": args.max_retries,
+            "requests_per_minute": args.requests_per_minute,
         }
-        if not args.quiet: print(f"⚖️  Using '{args.judge_type}' judge.")
+        judge_config = {
+            "judge_type": args.judge_type,
+            "api_config": api_config,
+        }
     else:
-        if not args.quiet: print("⚖️  Using default rule-based matching.")
+        raise ValueError("Judge type must be either api or local")
+    
+    
+    if not args.quiet: print(f"⚖️  Using '{args.judge_type}' judge.")
 
     try:
         if args.batch_dir:
@@ -93,18 +146,4 @@ Examples:
         sys.exit(1)
 
 if __name__ == "__main__":
-    # ------------------- 核心修改在这里 -------------------
-    import multiprocessing
-    
-    # 在Linux上，默认是 'fork'，这在多GPU的CUDA环境中是致命的。
-    # 我们必须在任何CUDA/PyTorch/VLLM操作之前，
-    # 强制将进程启动方法设置为 'spawn'。
-    # "force=True" 是为了确保即使它已经被设置过，我们也能覆盖它。
-    try:
-        multiprocessing.set_start_method('spawn', force=True)
-    except RuntimeError:
-        # 如果启动方法已经被设置，可能会抛出 RuntimeError。
-        # 我们可以安全地忽略它，因为它可能已经被正确设置了。
-        pass
-    # ----------------------------------------------------
     main()
