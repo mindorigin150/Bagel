@@ -1,5 +1,6 @@
 # evaluation/judgement.py
 import abc
+from asyncio import as_completed
 import os
 import requests
 import json
@@ -128,7 +129,7 @@ class APIModelJudge(BaseJudge):
     Judges correctness by calling an external API (e.g., OpenAI, Anthropic).
     This version operates sequentially with rate limiting and retry logic.
     """
-    def __init__(self, endpoint: str, api_key: str = None, timeout: int = 120, model: str = "gpt-4o", max_retries: int = 10, requests_per_minute: int = 60):
+    def __init__(self, endpoint: str, api_key: str = None, timeout: int = 120, model: str = "gpt-4o", max_retries: int = 10, requests_per_minute: int = 60, max_workers: int = 10):
         """
         Args:
             endpoint: The API endpoint URL.
@@ -137,6 +138,7 @@ class APIModelJudge(BaseJudge):
             model: The model name to use.
             max_retries: The maximum number of times to retry a failed API request.
             requests_per_minute: The number of requests to allow per minute for rate limiting.
+            max_workers: workers for concurrent threads
         """
         if not endpoint:
             raise ValueError("API endpoint cannot be empty.")
@@ -151,6 +153,7 @@ class APIModelJudge(BaseJudge):
             raise ValueError("requests_per_minute must be positive.")
         # calculate interval for each request
         self.request_interval = 60.0 / requests_per_minute
+        self.max_workers = max_workers
 
     def judge(self, question: str, model_answer: str, ground_truth_answer: str) -> JudgementResult:
         """
@@ -205,13 +208,46 @@ class APIModelJudge(BaseJudge):
         if not items:
             return
 
-        for i, (question, model_answer, gt_answer) in enumerate(tqdm(items, desc="Judging items sequentially", unit="item")):
-            result = self.judge(question, model_answer, gt_answer)
-            yield i, result
-
-            if i < len(items) - 1:
-                time.sleep(self.request_interval)
-
+        items_to_judge = [(i, q, ans, gt) for i, (q, ans, gt) in enumerate(items)]
+        
+        for attempt in range(self.max_retries + 1):
+            # if all tasks have completed
+            if not items_to_judge:
+                break
+            print(f"🚀 Starting judgement batch... Attempt {attempt + 1}, items remaining: {len(items_to_judge)}")
+            failed_items_for_next_round = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                future_to_item = {}
+                for original_index, q, ans, gt in tqdm(items_to_judge, desc=f"Submitting tasks (Attempt {attempt + 1})", unit="task"):
+                    future = executor.submit(self.judge, q, ans, gt)
+                    future_to_item[future] = (original_index, q, ans, gt)
+                    time.sleep(self.request_interval)
+                
+                completed_iterator = concurrent.futures.as_completed(future_to_item)
+                for future in tqdm(completed_iterator, total=len(items_to_judge), desc=f"Receiving results (Attempt {attempt + 1})", unit="result"):
+                    original_index, q, ans, gt = future_to_item[future]
+                    try:
+                        result = future.result()
+                        
+                        if "Failed to parse" in result["reason"]:
+                            failed_items_for_next_round.append((original_index, q, ans, gt))
+                        else:
+                            yield original_index, result
+                    except Exception as e:
+                        print(f"⚠️ Error processing item {original_index}: {e}. Will retry.")
+                        failed_items_for_next_round.append((original_index, q, ans, gt))
+                        
+            items_to_judge = failed_items_for_next_round
+        
+        # If all attempts failed, record the final failure information
+        if items_to_judge:
+            print(f"\n❌ Giving up on {len(items_to_judge)} items after {self.max_retries + 1} attempts.")
+            for original_index, _, _, _ in items_to_judge:
+                final_error_result = {
+                    "is_correct": False,
+                    "reason": f"Failed to parse model judgement after {self.max_retries} retries."
+                }
+                yield original_index, final_error_result
 
 class LocalJudge(BaseJudge):
     """Judges correctness using a local model via a unified inference engine."""
@@ -301,9 +337,9 @@ class LocalJudge(BaseJudge):
             
             items_to_judge = failed_items_for_next_round
             if items_to_judge:
-                print(f"⚠️ {len(items_to_judge)} items failed parsing. Preparing for retry {attempt + 1}/{self.max_retries}...")
+                print(f"⚠️ {len(items_to_judge)} items failed parsing. Preparing for retry {attempt + 1}/{self.max_retries + 1}...")
         
-        for original_index, _, _ in items_to_judge:
+        for original_index, _, _, _ in items_to_judge:
             final_error_result = {
                 "is_correct": False,
                 "reason": f"Failed to parse model judgement after {self.max_retries} retries."
