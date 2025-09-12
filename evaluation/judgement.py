@@ -290,7 +290,7 @@ class LocalJudge(BaseJudge):
             failed_items_for_next_round = []
             # process results for current batch
             for i, response in enumerate(responses):
-                original_index, model_answer, gt_answer = items_to_judge[i]
+                original_index, _, _, _ = items_to_judge[i]
                 # parse output
                 result = _parse_llm_json_output(response)
                 # determine if success or not
